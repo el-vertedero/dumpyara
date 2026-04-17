@@ -120,7 +120,7 @@ else
     fi
 fi
 
-ORG=Jiovanni-dump #your GitHub org name
+ORG=el-vertedero #your GitHub org name
 EXTENSION=$(echo "${INPUT##*.}" | inline-detox)
 UNZIP_DIR=$(basename "${INPUT/.$EXTENSION/}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
 WORKING=${PWD}/working/${UNZIP_DIR}_
@@ -571,7 +571,7 @@ fi
 
 # Telegram channel
 if [[ -n "$TG_TOKEN" ]]; then
-    CHAT_ID="@jiovanni_dumps"
+    CHAT_ID="@vertedero_de_dumps"
     commit_head=$(git log --format=format:%H | head -n 1)
     commit_link="https://github.com/$ORG/$repo/commit/$commit_head"
     echo -e "Sending telegram notification"
