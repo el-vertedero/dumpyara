@@ -519,6 +519,11 @@ if [[ -n $GIT_OAUTH_TOKEN ]]; then
     GITPUSH=(git push https://"$GIT_OAUTH_TOKEN"@github.com/"$ORG"/"${repo,,}".git "$branch")
     curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && echo "Firmware already dumped!" && exit 1
     git init
+    git config pack.windowMemory  256m
+    git config pack.packSizeLimit 512m
+    git config pack.threads       1
+    git config core.bigFileThreshold 64m
+    git config http.postBuffer    524288000
     if [[ -z "$(git config --get user.email)" ]]; then
         git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
     fi
@@ -537,7 +542,7 @@ if [[ -n $GIT_OAUTH_TOKEN ]]; then
 
         if [ -f "$file_path" ]; then
             local compressed_file="${file_path}.zst"
-            zstdmt --ultra -22 --long -M512 "$file_path" -o "$compressed_file"
+            zstdmt -T2 -19 --long=27 "$file_path" -o "$compressed_file"
             if [ $(stat -c%s "$compressed_file") -le $max_size ]; then
                 echo "$compressed_file"
             else
@@ -549,7 +554,7 @@ if [[ -n $GIT_OAUTH_TOKEN ]]; then
     export -f compress_file
 
     # Process files in parallel and collect compressed filenames
-    cat .gitignore | xargs -P $(nproc) -I {} bash -c 'compress_file "{}"' > compressed_files.txt
+    cat .gitignore | xargs -P 2 -I {} bash -c 'compress_file "{}"' > compressed_files.txt
     echo "fs_config_dirs" >> .gitignore
     echo "fs_config_files" >> .gitignore
 
