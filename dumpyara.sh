@@ -49,68 +49,99 @@ if echo "${1}" | grep -e '^\(https\?\|ftp\)://.*$' > /dev/null; then
     # Set 'URL' to appended string
     URL="${1}"
 
-    # Override '${URL}' with best possible mirror of it
-    case "${URL}" in
-        # For Xiaomi: replace '${URL}' with (one of) the fastest mirror
-        *"d.miui.com"*)
-            # Do not run this loop in case we're already using one of the reccomended mirrors
-            if ! echo "${URL}" | rg -q 'cdnorg|bkt-sgp-miui-ota-update-alisgp'; then
-                # Set '${URL_ORIGINAL}' and '${FILE_PATH}' in case we might need to roll back
-                URL_ORIGINAL=$(echo "${URL}" | sed -E 's|(https://[^/]+).*|\1|')
-                FILE_PATH=$(echo "${URL#*d.miui.com/}" | sed 's/?.*//')
+    # Google Drive needs special handling: filename isn't in the URL and
+    # large files require a confirmation token. Delegate to 'gdown'.
+    if [[ "${URL}" == *"drive.google.com"* ]] || [[ "${URL}" == *"docs.google.com"* ]]; then
+        LOGI "Google Drive link detected. Downloading via 'gdown'..."
+        LOGI "Started downloading file from link... ($(date +%R:%S))"
 
-                # Array of different possible mirrors
-                MIRRORS=(
-                    "https://cdnorg.d.miui.com"
-                    "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"
-                    "https://bn.d.miui.com"
-                    "${URL_ORIGINAL}"
-                )
+        # 'gdown' picks the filename from Drive's metadata, so let it
+        # download into an empty staging directory and pick the file up after.
+        GDRIVE_STAGE="${PWD}/working/.gdrive"
+        rm -rf "${GDRIVE_STAGE}"
+        mkdir -p "${GDRIVE_STAGE}"
 
-                # Check back and forth for the best available mirror
-                for URLS in "${MIRRORS[@]}"; do
-                    # Change mirror's domain with one(s) from array
-                    URL=${URLS}/${FILE_PATH}
+        ( cd "${GDRIVE_STAGE}" && uvx gdown "${URL}" ) || \
+            LOGF "Failed to download file from Google Drive. Aborting."
 
-                    # Be sure that the mirror is available. Once found, break the loop 
-                    if [ "$(curl -I -sS "${URL}" | head -n1 | cut -d' ' -f2)" == "404" ]; then
-                        LOGW "${URLS} is not available. Trying with other mirror(s)..."
-                    else
-                        LOGI "Found best available mirror."
-                        break
-                    fi
-                done
-            fi
-            ;;
-            # For Pixeldrain: replace the link with a direct one
-            *"pixeldrain.com/u"*)
-                LOGI "Replacing with best available mirror."
-                URL="https://pd.cybar.xyz/${URL##*/}"
-            ;;
-            *"pixeldrain.com/d"*)
-                LOGI "Replacing with direct download link."
-                URL="https://pixeldrain.com/api/filesystem/${URL##*/}"
-            ;;
-        esac
-    
-    # Sanitize file name and path
-    FILENAME="$(basename "${URL}")"
-    SAFE_FILENAME=$(echo "${FILENAME}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
-    DEST_PATH="${PWD}/working/${SAFE_FILENAME}"
+        LOGI "Finished downloading file. ($(date +%R:%S))"
 
-    # Start downloading from 'aria2c' and, if failed, 'wget'
-    LOGI "Started downloading file from link... ($(date +%R:%S))"
+        # Locate the downloaded file and sanitize its name
+        DOWNLOADED_FILE=$(find "${GDRIVE_STAGE}" -maxdepth 1 -type f | head -n 1)
+        [[ -z "${DOWNLOADED_FILE}" ]] && LOGF "Could not locate file downloaded by 'gdown'."
 
-    aria2c -q -s16 -x16 --check-certificate=false -d "${PWD}/working" -o "${SAFE_FILENAME}" "${URL}" || {
-        rm -fv "${DEST_PATH}"
-        wget -q --no-check-certificate -O "${DEST_PATH}" "${URL}" || \
-            LOGF "Failed to download file. Aborting."
-    }
+        SAFE_FILENAME=$(basename "${DOWNLOADED_FILE}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
+        DEST_PATH="${PWD}/working/${SAFE_FILENAME}"
 
-    LOGI "Finished downloading file. ($(date +%R:%S))"
+        mv "${DOWNLOADED_FILE}" "${DEST_PATH}"
+        rm -rf "${GDRIVE_STAGE}"
 
-    # Set 'INPUT' variable for rest of script
-    INPUT="${DEST_PATH}"
+        # Set 'INPUT' variable for rest of script
+        INPUT="${DEST_PATH}"
+    else
+        # Override '${URL}' with best possible mirror of it
+        case "${URL}" in
+            # For Xiaomi: replace '${URL}' with (one of) the fastest mirror
+            *"d.miui.com"*)
+                # Do not run this loop in case we're already using one of the reccomended mirrors
+                if ! echo "${URL}" | rg -q 'cdnorg|bkt-sgp-miui-ota-update-alisgp'; then
+                    # Set '${URL_ORIGINAL}' and '${FILE_PATH}' in case we might need to roll back
+                    URL_ORIGINAL=$(echo "${URL}" | sed -E 's|(https://[^/]+).*|\1|')
+                    FILE_PATH=$(echo "${URL#*d.miui.com/}" | sed 's/?.*//')
+
+                    # Array of different possible mirrors
+                    MIRRORS=(
+                        "https://cdnorg.d.miui.com"
+                        "https://bkt-sgp-miui-ota-update-alisgp.oss-ap-southeast-1.aliyuncs.com"
+                        "https://bn.d.miui.com"
+                        "${URL_ORIGINAL}"
+                    )
+
+                    # Check back and forth for the best available mirror
+                    for URLS in "${MIRRORS[@]}"; do
+                        # Change mirror's domain with one(s) from array
+                        URL=${URLS}/${FILE_PATH}
+
+                        # Be sure that the mirror is available. Once found, break the loop 
+                        if [ "$(curl -I -sS "${URL}" | head -n1 | cut -d' ' -f2)" == "404" ]; then
+                            LOGW "${URLS} is not available. Trying with other mirror(s)..."
+                        else
+                            LOGI "Found best available mirror."
+                            break
+                        fi
+                    done
+                fi
+                ;;
+                # For Pixeldrain: replace the link with a direct one
+                *"pixeldrain.com/u"*)
+                    LOGI "Replacing with best available mirror."
+                    URL="https://pd.cybar.xyz/${URL##*/}"
+                ;;
+                *"pixeldrain.com/d"*)
+                    LOGI "Replacing with direct download link."
+                    URL="https://pixeldrain.com/api/filesystem/${URL##*/}"
+                ;;
+            esac
+
+        # Sanitize file name and path
+        FILENAME="$(basename "${URL}")"
+        SAFE_FILENAME=$(echo "${FILENAME}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
+        DEST_PATH="${PWD}/working/${SAFE_FILENAME}"
+
+        # Start downloading from 'aria2c' and, if failed, 'wget'
+        LOGI "Started downloading file from link... ($(date +%R:%S))"
+
+        aria2c -q -s16 -x16 --check-certificate=false -d "${PWD}/working" -o "${SAFE_FILENAME}" "${URL}" || {
+            rm -fv "${DEST_PATH}"
+            wget -q --no-check-certificate -O "${DEST_PATH}" "${URL}" || \
+                LOGF "Failed to download file. Aborting."
+        }
+
+        LOGI "Finished downloading file. ($(date +%R:%S))"
+
+        # Set 'INPUT' variable for rest of script
+        INPUT="${DEST_PATH}"
+    fi
 else
     # Otherwise, check if it's a file or directory
     if [[ -e ${1} ]]; then

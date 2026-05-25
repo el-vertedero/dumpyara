@@ -77,5 +77,8 @@ fi
 LOGI "Installing 'uv'..."
 curl -LsSf https://astral.sh/uv/install.sh | sh > /dev/null 2>&1 
 
+LOGI "Pre-warming 'uvx' cache..."
+"$HOME"/.local/bin/uvx --help gdown > /dev/null 2>&1 || true
+
 # Finish
 LOGI "Set-up finished. You may now execute 'dumpyara.sh'."
