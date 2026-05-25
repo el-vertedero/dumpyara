@@ -515,6 +515,14 @@ manufacturer=$(echo "$manufacturer" | tr '[:upper:]' '[:lower:]' | tr -dc '[:pri
 printf "# %s\n- manufacturer: %s\n- platform: %s\n- codename: %s\n- flavor: %s\n- release: %s\n- id: %s\n- incremental: %s\n- tags: %s\n- fingerprint: %s\n- is_ab: %s\n- brand: %s\n- branch: %s\n- repo: %s\n" "$description" "$manufacturer" "$platform" "$codename" "$flavor" "$release" "$id" "$incremental" "$tags" "$fingerprint" "$is_ab" "$brand" "$branch" "$repo" > "${WORKING}"/README.md
 cat "${WORKING}"/README.md
 
+# Bail out if the dump is incomplete (no point pushing an empty repo
+# or spamming Telegram with a blank notification).
+if [[ -z "${codename}" || -z "${fingerprint}" || -z "${brand}" ]]; then
+    LOGE "Incomplete dump: missing codename/brand/fingerprint."
+    LOGE "Skipping GitHub push and Telegram notification."
+    exit 1
+fi
+
 if [[ -n $GIT_OAUTH_TOKEN ]]; then
     GITPUSH=(git push https://"$GIT_OAUTH_TOKEN"@github.com/"$ORG"/"${repo,,}".git "$branch")
     curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && echo "Firmware already dumped!" && exit 1
