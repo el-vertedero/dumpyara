@@ -124,7 +124,7 @@ if echo "${1}" | grep -e '^\(https\?\|ftp\)://.*$' > /dev/null; then
             esac
 
         # Sanitize file name and path
-        FILENAME="$(basename "${URL}")"
+        FILENAME="$(basename "${URL%%[?#]*}")"
         SAFE_FILENAME=$(echo "${FILENAME}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
         DEST_PATH="${PWD}/working/${SAFE_FILENAME}"
 
