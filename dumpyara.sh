@@ -176,8 +176,9 @@ else
 fi
 
 # Extract input via 'Firmware_extractor'
-[[ ! -d "${INPUT}" ]] && \
+if [[ ! -d "${INPUT}" ]]; then
     bash "$PWD"/external/Firmware_extractor/extractor.sh "${INPUT}" "${WORKING}" || LOGF "Extraction failed. Aborting."
+fi
 
 # Retrive 'extract-ikconfig' from torvalds/linux
 if ! [[ -f "${PWD}"/external/extract-ikconfig ]]; then
