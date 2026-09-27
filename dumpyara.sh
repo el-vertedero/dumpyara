@@ -388,7 +388,7 @@ tags=$(echo "$tags" | head -n 1)
 # 'platform' property (e.g. zumapro)
 platform=$(rg -m1 -INoP --no-messages "(?<=^ro.board.platform=).*" {vendor,system,system/system}/build*.prop | head -n 1)
 [[ -z ${platform} ]] && platform=$(rg -m1 -INoP --no-messages "(?<=^ro.vendor.board.platform=).*" vendor/build*.prop | head -n 1)
-[[ -z ${platform} ]] && platform=$(rg -m1 -INoP --no-messages rg"(?<=^ro.system.board.platform=).*" {system,system/system}/build*.prop | head -n 1)
+[[ -z ${platform} ]] && platform=$(rg -m1 -INoP --no-messages "(?<=^ro.system.board.platform=).*" {system,system/system}/build*.prop | head -n 1)
 platform=$(echo "$platform" | head -n 1)
 
 # 'manufacturer' property (e.g. google)
