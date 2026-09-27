@@ -282,8 +282,9 @@ done
 if [[ -f boot.img ]]; then
     # Extract 'ikconfig'
     LOGI "Extracting 'ikconfig'..."
-    ${EXTRACT_IKCONFIG} boot.img > ikconfig || {
-        LOGE "Failed to generate 'ikconfig'"
+    ${EXTRACT_IKCONFIG} boot.img > ikconfig 2>/dev/null || {
+        LOGW "No 'ikconfig' found in 'boot.img'"
+        rm -f ikconfig
     }
 
     # Generate non-stack symbols
