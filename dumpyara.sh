@@ -131,13 +131,25 @@ if echo "${1}" | grep -e '^\(https\?\|ftp\)://.*$' > /dev/null; then
         # Start downloading from 'aria2c' and, if failed, 'wget'
         LOGI "Started downloading file from link... ($(date +%R:%S))"
 
-        aria2c -q -s16 -x16 --check-certificate=false -d "${PWD}/working" -o "${SAFE_FILENAME}" "${URL}" || {
-            rm -fv "${DEST_PATH}"
-            wget -q --no-check-certificate -O "${DEST_PATH}" "${URL}" || \
-                LOGF "Failed to download file. Aborting."
-        }
+        if [[ "${URL}" == *"temp.sh/"* ]]; then
+            # temp.sh serves a landing page on GET; the file itself requires a POST
+            curl -fsSL -X POST -o "${DEST_PATH}" "${URL}" || \
+                LOGF "Failed to download file from temp.sh (download limit reached?). Aborting."
+        else
+            aria2c -q -s16 -x16 --check-certificate=false -d "${PWD}/working" -o "${SAFE_FILENAME}" "${URL}" || {
+                rm -fv "${DEST_PATH}"
+                wget -q --no-check-certificate -O "${DEST_PATH}" "${URL}" || \
+                    LOGF "Failed to download file. Aborting."
+            }
+        fi
 
         LOGI "Finished downloading file. ($(date +%R:%S))"
+
+        # Bail out if the host handed us a web page instead of the file
+        if [[ "$(file -b --mime-type "${DEST_PATH}")" == "text/html" ]]; then
+            rm -f "${DEST_PATH}"
+            LOGF "Downloaded file is an HTML page, not firmware. Is the link a direct download? Aborting."
+        fi
 
         # Set 'INPUT' variable for rest of script
         INPUT="${DEST_PATH}"
