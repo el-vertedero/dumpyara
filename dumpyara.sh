@@ -51,6 +51,13 @@ if echo "${1}" | grep -e '^\(https\?\|ftp\)://.*$' > /dev/null; then
 
     # Google Drive needs special handling: filename isn't in the URL and
     # large files require a confirmation token. Delegate to 'gdown'.
+    if [[ "${URL}" == *"drive.usercontent.google.com"* ]]; then
+        # 'gdown' doesn't recognize this host, rewrite it to a regular Drive link
+        GDRIVE_ID=$(echo "${URL}" | grep -oP '[?&]id=\K[^&]+')
+        [[ -z "${GDRIVE_ID}" ]] && LOGF "Could not extract file ID from Google Drive link. Aborting."
+        URL="https://drive.google.com/uc?id=${GDRIVE_ID}"
+    fi
+
     if [[ "${URL}" == *"drive.google.com"* ]] || [[ "${URL}" == *"docs.google.com"* ]]; then
         LOGI "Google Drive link detected. Downloading via 'gdown'..."
         LOGI "Started downloading file from link... ($(date +%R:%S))"
