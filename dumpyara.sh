@@ -545,7 +545,10 @@ if [[ -z "${codename}" || -z "${fingerprint}" || -z "${brand}" ]]; then
 fi
 
 if [[ -n $GIT_OAUTH_TOKEN ]]; then
-    GITPUSH=(git push https://"$GIT_OAUTH_TOKEN"@github.com/"$ORG"/"${repo,,}".git "$branch")
+    # Send the token as a header instead of embedding it in the URL: git drops
+    # URL credentials when it thinks the remote redirected, then tries to prompt.
+    GIT_AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$GIT_OAUTH_TOKEN" | base64 -w0)"
+    GITPUSH=(git -c http.extraHeader="$GIT_AUTH_HEADER" push https://github.com/"$ORG"/"${repo,,}".git "$branch")
     curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && LOGE "Firmware already dumped!" && exit 1
     git init
     git config pack.windowMemory  256m
