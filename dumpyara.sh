@@ -227,17 +227,32 @@ LOGI "Extracting partitions..."
 for partition in "${PARTITIONS[@]}"; do
     # Proceed only if the image from 'PARTITIONS' array exists
     if [[ -f "${partition}".img ]]; then
-        # Try to extract file through '7z'
+        # Try EROFS first, then squashfs, falling back to '7z' as a catch-all.
         ${FSCK_EROFS} --extract="${partition}" "${partition}".img >> /dev/null 2>&1 || {
+            if [[ "$(file -b "${partition}".img)" == *Squashfs* ]]; then
+                # 'unsquashfs' reproduces symlink chains that newer '7z'
+                # refuses as "dangerous" (and aborts on). '-no-xattrs' avoids a
+                # non-zero exit when run without root (SELinux labels can't be
+                # restored and aren't needed for dumping).
+                unsquashfs -no-xattrs -f -d "${partition}" "${partition}".img >> /dev/null 2>&1 || {
+                    LOGE "'${partition}' extraction via 'unsquashfs' failed."
+
+                    # Only abort if we're at the first occourence
+                    if [[ "${partition}" == "${PARTITIONS[0]}" ]]; then
+                        LOGF "Aborting dumping considering it's a crucial partition."
+                    fi
+                }
+            else
                 # Try to extract file through '7z'
                 7z -snld x "${partition}".img -y -o"${partition}"/ > /dev/null || {
-                LOGE "'${partition}' extraction via '7z' failed."
+                    LOGE "'${partition}' extraction via '7z' failed."
 
-                # Only abort if we're at the first occourence
-                if [[ "${partition}" == "${PARTITIONS[0]}" ]]; then
-                    LOGF "Aborting dumping considering it's a crucial partition."
-                fi
-            }
+                    # Only abort if we're at the first occourence
+                    if [[ "${partition}" == "${PARTITIONS[0]}" ]]; then
+                        LOGF "Aborting dumping considering it's a crucial partition."
+                    fi
+                }
+            fi
         }
 
         # Clean-up
