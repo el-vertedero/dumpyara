@@ -21,3 +21,5 @@ Before you start, make sure that dumpyara scripts are mapped to your own org or 
 
 **Supported image types**:
 check [here](https://github.com/AndroidDumps/Firmware_extractor/blob/master/extractor.sh#L3)
+
+VegaOS (newer Fire TV / Echo devices) SWUpdate packages are handled by dumpyara itself.

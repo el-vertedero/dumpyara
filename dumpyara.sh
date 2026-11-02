@@ -22,6 +22,114 @@ LOGF() {
     exit 1
 }
 
+# Whether '$1' is an SWUpdate package: a 'newc' cpio archive whose first
+# entry is 'sw-description'. VegaOS (Fire TV, Echo) firmware ships like this.
+is_swupdate() {
+    [[ -f "${1}" ]] || return 1
+    [[ "$(head -c 6 "${1}")" == 07070[12] ]] || return 1
+    [[ "$(dd if="${1}" bs=1 skip=110 count=15 2> /dev/null | LC_ALL=C tr '\0' '\n')" == "sw-description" ]]
+}
+
+# Print the filesystem ('squashfs' or 'erofs') of image '$1', fail otherwise
+fs_type() {
+    [[ -f "${1}" ]] || return 1
+    case "$(od -A n -t x1 -N 4 "${1}" | tr -d ' \n')" in
+        68737173|73717368) echo "squashfs"; return 0 ;;
+    esac
+    [[ "$(od -A n -t x1 -j 1024 -N 4 "${1}" 2> /dev/null | tr -d ' \n')" == "e2e1f5e0" ]] && echo "erofs"
+}
+
+# Print the value of key '$2' from 'os-release' file '$1' (without sourcing it)
+os_release() {
+    sed -n "s/^${2}=//p" "${1}" | head -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+
+# Get the current directory ready to be pushed to '${ORG}/${repo}' (branch
+# '${branch}'): bail out if it's already there, create the repository and
+# replace files too large for GitHub with compressed copies. Committing and
+# pushing (through '${GITPUSH[@]}') is left to the caller.
+prepare_push() {
+    # Send the token as a header instead of embedding it in the URL: git drops
+    # URL credentials when it thinks the remote redirected, then tries to prompt.
+    GIT_AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$GIT_OAUTH_TOKEN" | base64 -w0)"
+    GITPUSH=(git -c http.extraHeader="$GIT_AUTH_HEADER" push https://github.com/"$ORG"/"${repo,,}".git "$branch")
+    curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && LOGE "Firmware already dumped!" && exit 1
+    git init
+    git config pack.windowMemory  256m
+    git config pack.packSizeLimit 512m
+    git config pack.threads       1
+    git config core.bigFileThreshold 64m
+    git config http.postBuffer    524288000
+    if [[ -z "$(git config --get user.email)" ]]; then
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+    fi
+    if [[ -z "$(git config --get user.name)" ]]; then
+        git config user.name "github-actions[bot]"
+    fi
+    curl -s -X POST -H "Authorization: token ${GIT_OAUTH_TOKEN}" -d '{ "name": "'"$repo"'" }' "https://api.github.com/orgs/${ORG}/repos" #create new repo
+    # Empty topics would get the whole request rejected, so leave them out
+    topics=$(printf '"%s",' "$manufacturer" "$platform" "$top_codename" | sed -e 's/"",//g' -e 's/,$//')
+    curl -s -X PUT -H "Authorization: token ${GIT_OAUTH_TOKEN}" -H "Accept: application/vnd.github.mercy-preview+json" -d '{ "names": ['"$topics"']}' "https://api.github.com/repos/${ORG}/${repo}/topics"
+    git remote add origin https://github.com/$ORG/"${repo,,}".git
+    git checkout -b "$branch"
+    find . -size +97M -printf '%P\n' -o -name "*sensetime*" -printf '%P\n' -o -name "*.lic" -printf '%P\n' >| .gitignore
+    # Compress large files in parallel
+    compress_file() {
+        local file_path="$1"
+        local max_size=$((99 * 1024 * 1024)) # 99MB
+
+        if [ -f "$file_path" ]; then
+            local compressed_file="${file_path}.zst"
+            zstdmt -T2 -19 --long=27 "$file_path" -o "$compressed_file"
+            if [ $(stat -c%s "$compressed_file") -le $max_size ]; then
+                echo "$compressed_file"
+            else
+                rm -f "$compressed_file"
+            fi
+        fi
+    }
+
+    export -f compress_file
+
+    # Process files in parallel and collect compressed filenames
+    cat .gitignore | xargs -P 2 -I {} bash -c 'compress_file "{}"' > compressed_files.txt
+    echo "fs_config_dirs" >> .gitignore
+    echo "fs_config_files" >> .gitignore
+
+    # Create extraction script
+    cat > extract_files.sh << 'EOF'
+#!/bin/bash
+
+while IFS= read -r file; do
+    unzstd "$file"
+done < compressed_files.txt
+EOF
+    chmod +x extract_files.sh
+}
+
+# Announce the dump on the Telegram channel
+send_telegram() {
+    [[ -z "$TG_TOKEN" ]] && return
+
+    CHAT_ID="@vertedero_de_dumps"
+    commit_head=$(git log --format=format:%H | head -n 1)
+    commit_link="https://github.com/$ORG/$repo/commit/$commit_head"
+    echo -e "Sending telegram notification"
+
+    TEXT=$(cat <<EOF
+<b>Brand: $brand</b>
+<b>Device: $codename</b>
+<b>Version:</b> $release
+<b>Fingerprint:</b> $fingerprint
+<b>GitHub:</b>
+<a href="$commit_link">Commit</a>
+<a href="https://github.com/$ORG/$repo/tree/$branch/">$codename</a>
+EOF
+)
+
+    curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendmessage" --data "text=${TEXT}&chat_id=${CHAT_ID}&parse_mode=HTML&disable_web_page_preview=True" > /dev/null
+}
+
 [[ $# = 0 ]] && \
     LOGF "No input provided."
 
@@ -194,11 +302,6 @@ else
     git clone -q --recurse-submodules https://github.com/R0rt1z2/Firmware_extractor "${PWD}"/external/Firmware_extractor
 fi
 
-# Extract input via 'Firmware_extractor'
-if [[ ! -d "${INPUT}" ]]; then
-    bash "$PWD"/external/Firmware_extractor/extractor.sh "${INPUT}" "${WORKING}" || LOGF "Extraction failed. Aborting."
-fi
-
 # Retrive 'extract-ikconfig' from torvalds/linux
 if ! [[ -f "${PWD}"/external/extract-ikconfig ]]; then
     curl -s -Lo "${PWD}"/external/extract-ikconfig https://raw.githubusercontent.com/torvalds/linux/refs/heads/master/scripts/extract-ikconfig
@@ -210,6 +313,189 @@ UNPACKBOOTIMG="${PWD}"/external/Firmware_extractor/tools/unpackbootimg
 VMLINUX_TO_ELF="uvx -q --from git+https://github.com/marin-m/vmlinux-to-elf@master"
 EXTRACT_IKCONFIG="${PWD}"/external/extract-ikconfig
 FSCK_EROFS="${PWD}"/external/Firmware_extractor/tools/fsck.erofs
+
+# VegaOS (newer Fire TV / Echo devices running Vega Linux instead of FireOS)
+# ships SWUpdate packages: filesystem images, a FIT 'boot.img' and install
+# scripts in a cpio archive. None of the Android handling below applies.
+if is_swupdate "${INPUT}"; then
+    LOGI "VegaOS (SWUpdate) package detected"
+    INPUT=$(realpath "${INPUT}")
+    mkdir -p "${WORKING}"
+    cd "${WORKING}" || exit
+
+    LOGI "Extracting package..."
+    cpio -idu --no-absolute-filenames --quiet < "${INPUT}" || \
+        LOGF "Failed to extract package. Aborting."
+    for gz in *.gz; do
+        [[ -f "${gz}" ]] && gunzip -f "${gz}"
+    done
+    rm -f sw-description.sig
+
+    # Extract filesystem images: the rootfs goes to 'system-rootfs/', the
+    # vendor one to 'vendor-rootfs/', anything else to a directory named after it
+    FS_DIRS=()
+    for image in *; do
+        fstype=$(fs_type "${image}") || continue
+
+        case "${image}" in
+            *vendor*) dir="vendor-rootfs" ;;
+            *rootfs*) dir="system-rootfs" ;;
+            *) dir="${image%%.*}" ;;
+        esac
+        [[ -e "${dir}" ]] && dir="${image}-extracted"
+        [[ "${dir}" == "system-rootfs" ]] && ROOTFS_IMAGE="${image}"
+
+        LOGI "Extracting '${image}' (${fstype}) to '${dir}/'..."
+        case "${fstype}" in
+            squashfs) unsquashfs -no-xattrs -f -d "${dir}" "${image}" ;;
+            erofs) ${FSCK_EROFS} --extract="${dir}" "${image}" ;;
+        esac > /dev/null 2>&1 || LOGW "Errors while extracting '${image}', keeping whatever came out."
+
+        # Without root some entries (e.g. device nodes) can't be created, so
+        # only give up if nothing came out at all
+        if [[ -z "$(ls -A "${dir}" 2> /dev/null)" ]]; then
+            rm -rf "${dir}"
+            [[ "${dir}" == "system-rootfs" ]] && LOGF "Failed to extract rootfs. Aborting."
+            LOGE "Failed to extract '${image}'."
+            continue
+        fi
+
+        # Make sure git can read everything
+        chmod -R u+rwX "${dir}"
+        rm -f "${image}"
+        FS_DIRS+=("${dir}")
+    done
+
+    # Build information lives in the rootfs' 'os-release'. Skip absolute
+    # symlinks, those would resolve against the host.
+    OS_RELEASE=/dev/null
+    for file in system-rootfs/etc/os-release system-rootfs/usr/lib/os-release; do
+        if [[ -f "${file}" && "$(readlink "${file}")" != /* ]]; then
+            OS_RELEASE="${file}"
+            break
+        fi
+    done
+    [[ "${OS_RELEASE}" == /dev/null ]] && LOGW "No 'os-release' found in rootfs."
+
+    os_name=$(os_release "${OS_RELEASE}" NAME)
+    os_version=$(os_release "${OS_RELEASE}" OS_VERSION)
+    [[ -z ${os_version} ]] && os_version=$(os_release "${OS_RELEASE}" VERSION_ID)
+    branch_code=$(os_release "${OS_RELEASE}" BRANCH_CODE)
+    build_date=$(os_release "${OS_RELEASE}" BUILD_DATE)
+    version_number=$(os_release "${OS_RELEASE}" VERSION_NUMBER)
+    description=$(os_release "${OS_RELEASE}" BUILD_DESC)
+    fingerprint=$(os_release "${OS_RELEASE}" BUILD_FINGERPRINT)
+
+    # Codename comes from the rootfs image name ('rootfs-<codename>.*'),
+    # falling back to the fingerprint
+    codename=$(echo "${ROOTFS_IMAGE}" | sed -n 's/.*rootfs-\([^.]*\).*/\1/p')
+    [[ -z ${codename} ]] && codename=$(echo "${fingerprint}" | cut -d : -f 1 | awk -F / '{ print $NF }')
+
+    brand="Amazon"
+    manufacturer="amazon"
+    platform=""
+    release="${os_version}"
+    [[ -z ${description} ]] && description="${codename}-${version_number:-${os_version}}"
+    branch=$(echo "$description" | tr ' ' '-')
+    repo=$(echo "$brand"_"$codename"_dump | tr '[:upper:]' '[:lower:]' | tr -d '\r\n')
+    top_codename=$(echo "$codename" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
+
+    # 'boot.img' is a FIT image: pull out everything it carries
+    if [[ -f boot.img ]] && [[ "$(od -A n -t x1 -N 4 boot.img | tr -d ' \n')" == "d00dfeed" ]]; then
+        if ! command -v dumpimage > /dev/null 2>&1; then
+            LOGE "'dumpimage' not found (install 'u-boot-tools'), skipping 'boot.img'."
+        else
+            LOGI "Extracting 'boot.img' (FIT) content..."
+            mkdir -p boot/dtb boot/dts
+            dumpimage -l boot.img > boot/fit-info.txt 2>&1 || \
+                LOGE "Failed to list 'boot.img' content."
+
+            # Every image is listed as ' Image <index> (<name>)', then its 'Type:'
+            while read -r index name type <&3; do
+                dumpimage -T flat_dt -p "${index}" -o "boot/${name}" boot.img > /dev/null 2>&1 || {
+                    LOGE "Failed to extract '${name}' from 'boot.img'."
+                    continue
+                }
+
+                case "${type}" in
+                    "Kernel Image"*)
+                        if [[ ! -f ikconfig ]]; then
+                            ${EXTRACT_IKCONFIG} "boot/${name}" > ikconfig 2> /dev/null || rm -f ikconfig
+                        fi
+                        ;;
+                    "Flat Device Tree")
+                        mv "boot/${name}" "boot/dtb/${name}.dtb"
+                        dtc -q -I dtb -O dts -o "boot/dts/${name}.dts" "boot/dtb/${name}.dtb" || \
+                            LOGE "Failed to decompile '${name}'."
+                        ;;
+                    "RAMDisk Image")
+                        case "$(od -A n -t x1 -N 4 "boot/${name}" | tr -d ' \n')" in
+                            1f8b*) unpack="gzip -dc" ;;
+                            fd377a58) unpack="xz -dc" ;;
+                            28b52ffd) unpack="zstd -dc" ;;
+                            02214c18|04224d18) unpack="lz4 -dc" ;;
+                            *) unpack="cat" ;;
+                        esac
+                        mkdir -p "boot/${name}-extracted"
+                        { ${unpack} "boot/${name}" | (cd "boot/${name}-extracted" && cpio -idu --no-absolute-filenames --quiet); } > /dev/null 2>&1 || \
+                            LOGW "Errors while extracting '${name}', keeping whatever came out."
+                        rmdir "boot/${name}-extracted" 2> /dev/null
+                        ;;
+                esac
+            done 3< <(awk '/^ *Image [0-9]+ \(/ { idx = $2; name = $3; gsub(/[()]/, "", name) }
+                          /^ *Type:/ && idx != "" { sub(/^ *Type: */, ""); print idx, name, $0; idx = "" }' boot/fit-info.txt)
+
+            rmdir boot/dtb boot/dts 2> /dev/null
+        fi
+    fi
+
+    # Sort out what's left
+    mkdir -p install-scripts firmware
+    for file in *.sh; do
+        [[ -f "${file}" ]] && mv "${file}" install-scripts/
+    done
+    for file in *.bin *.img; do
+        [[ -f "${file}" ]] && mv "${file}" firmware/
+    done
+    rmdir install-scripts firmware 2> /dev/null
+
+    LOGI "Generating 'all_files.txt'..."
+    find . -type f ! -name all_files.txt \
+         -printf '%P\n' | sort | grep -v ".git/" > ./all_files.txt
+
+    printf "# %s\n- manufacturer: %s\n- codename: %s\n- os: %s\n- version: %s\n- build date: %s\n- fingerprint: %s\n- brand: %s\n- branch: %s\n- repo: %s\n" \
+        "$description" "$manufacturer" "$codename" "$os_name $os_version${branch_code:+ ($branch_code)}" "$version_number" "$build_date" "$fingerprint" "$brand" "$branch" "$repo" > README.md
+    cat README.md
+
+    if [[ -z "${codename}" || -z "${fingerprint}" ]]; then
+        LOGE "Incomplete dump: missing codename/fingerprint."
+        LOGE "Skipping GitHub push and Telegram notification."
+        exit 1
+    fi
+
+    if [[ -n $GIT_OAUTH_TOKEN ]]; then
+        prepare_push
+        # Extracted filesystems are the bulk of it, push them one by one
+        git add --all
+        [[ ${#FS_DIRS[@]} -gt 0 ]] && git reset -q HEAD -- "${FS_DIRS[@]}"
+        git commit -asm "Add extras for ${description}" && "${GITPUSH[@]}"
+        for dir in "${FS_DIRS[@]}"; do
+            git add "${dir}"
+            git commit -asm "Add ${dir} for ${description}" && "${GITPUSH[@]}"
+        done
+    else
+        LOGI "Dump done locally."
+        exit 1
+    fi
+
+    send_telegram
+    exit 0
+fi
+
+# Extract input via 'Firmware_extractor'
+if [[ ! -d "${INPUT}" ]]; then
+    bash "$PWD"/external/Firmware_extractor/extractor.sh "${INPUT}" "${WORKING}" || LOGF "Extraction failed. Aborting."
+fi
 
 # Initialize images extraction
 cd "${WORKING}" || exit
@@ -560,60 +846,7 @@ if [[ -z "${codename}" || -z "${fingerprint}" || -z "${brand}" ]]; then
 fi
 
 if [[ -n $GIT_OAUTH_TOKEN ]]; then
-    # Send the token as a header instead of embedding it in the URL: git drops
-    # URL credentials when it thinks the remote redirected, then tries to prompt.
-    GIT_AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$GIT_OAUTH_TOKEN" | base64 -w0)"
-    GITPUSH=(git -c http.extraHeader="$GIT_AUTH_HEADER" push https://github.com/"$ORG"/"${repo,,}".git "$branch")
-    curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && LOGE "Firmware already dumped!" && exit 1
-    git init
-    git config pack.windowMemory  256m
-    git config pack.packSizeLimit 512m
-    git config pack.threads       1
-    git config core.bigFileThreshold 64m
-    git config http.postBuffer    524288000
-    if [[ -z "$(git config --get user.email)" ]]; then
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-    fi
-    if [[ -z "$(git config --get user.name)" ]]; then
-        git config user.name "github-actions[bot]"
-    fi
-    curl -s -X POST -H "Authorization: token ${GIT_OAUTH_TOKEN}" -d '{ "name": "'"$repo"'" }' "https://api.github.com/orgs/${ORG}/repos" #create new repo
-    curl -s -X PUT -H "Authorization: token ${GIT_OAUTH_TOKEN}" -H "Accept: application/vnd.github.mercy-preview+json" -d '{ "names": ["'"$manufacturer"'","'"$platform"'","'"$top_codename"'"]}' "https://api.github.com/repos/${ORG}/${repo}/topics"
-    git remote add origin https://github.com/$ORG/"${repo,,}".git
-    git checkout -b "$branch"
-    find . -size +97M -printf '%P\n' -o -name "*sensetime*" -printf '%P\n' -o -name "*.lic" -printf '%P\n' >| .gitignore
-    # Compress large files in parallel
-    compress_file() {
-        local file_path="$1"
-        local max_size=$((99 * 1024 * 1024)) # 99MB
-
-        if [ -f "$file_path" ]; then
-            local compressed_file="${file_path}.zst"
-            zstdmt -T2 -19 --long=27 "$file_path" -o "$compressed_file"
-            if [ $(stat -c%s "$compressed_file") -le $max_size ]; then
-                echo "$compressed_file"
-            else
-                rm -f "$compressed_file"
-            fi
-        fi
-    }
-
-    export -f compress_file
-
-    # Process files in parallel and collect compressed filenames
-    cat .gitignore | xargs -P 2 -I {} bash -c 'compress_file "{}"' > compressed_files.txt
-    echo "fs_config_dirs" >> .gitignore
-    echo "fs_config_files" >> .gitignore
-
-    # Create extraction script
-    cat > extract_files.sh << 'EOF'
-#!/bin/bash
-
-while IFS= read -r file; do
-    unzstd "$file"
-done < compressed_files.txt
-EOF
-    chmod +x extract_files.sh
+    prepare_push
     git add --all
     git reset HEAD -- system/ system_ext/ vendor/ product/ odm/ my_*/
     git commit -asm "Add extras for ${description}" && "${GITPUSH[@]}"
@@ -653,22 +886,4 @@ else
 fi
 
 # Telegram channel
-if [[ -n "$TG_TOKEN" ]]; then
-    CHAT_ID="@vertedero_de_dumps"
-    commit_head=$(git log --format=format:%H | head -n 1)
-    commit_link="https://github.com/$ORG/$repo/commit/$commit_head"
-    echo -e "Sending telegram notification"
-
-    TEXT=$(cat <<EOF
-<b>Brand: $brand</b>
-<b>Device: $codename</b>
-<b>Version:</b> $release
-<b>Fingerprint:</b> $fingerprint
-<b>GitHub:</b>
-<a href="$commit_link">Commit</a>
-<a href="https://github.com/$ORG/$repo/tree/$branch/">$codename</a>
-EOF
-)
-
-    curl -s "https://api.telegram.org/bot${TG_TOKEN}/sendmessage" --data "text=${TEXT}&chat_id=${CHAT_ID}&parse_mode=HTML&disable_web_page_preview=True" > /dev/null
-fi
+send_telegram
