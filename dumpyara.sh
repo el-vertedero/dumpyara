@@ -467,11 +467,14 @@ if is_swupdate "${INPUT}"; then
         "$description" "$manufacturer" "$codename" "$os_name $os_version${branch_code:+ ($branch_code)}" "$version_number" "$build_date" "$fingerprint" "$brand" "$branch" "$repo" > README.md
     cat README.md
 
-    if [[ -z "${codename}" || -z "${fingerprint}" ]]; then
-        LOGE "Incomplete dump: missing codename/fingerprint."
+    # 'codename' names the repo and the branch, so it has to be there.
+    # A missing fingerprint is cosmetic, warn and carry on.
+    if [[ -z "${codename}" ]]; then
+        LOGE "Incomplete dump: missing codename."
         LOGE "Skipping GitHub push and Telegram notification."
         exit 1
     fi
+    [[ -z "${fingerprint}" ]] && LOGW "No fingerprint for this dump, pushing anyway."
 
     if [[ -n $GIT_OAUTH_TOKEN ]]; then
         prepare_push
@@ -811,6 +814,35 @@ brand=$(rg -m1 -INoP --no-messages "(?<=^ro.product.odm.brand=).*" odm/etc/"${co
 [[ -z ${brand} ]] && brand=$(echo "$fingerprint" | cut -d / -f1)
 [[ -z ${brand} ]] && brand="$manufacturer"
 
+# Some builds ship an empty 'ro.build.fingerprint=' (and an empty
+# 'ro.build.description=') in build.prop and let init derive the real
+# value at boot. The lookups above happily match that empty value, so
+# we may still be left with nothing here. Sweep every build.prop in the
+# dump for a fingerprint that actually has a value, preferring the
+# canonical property over the per-partition ones. Note the second sweep
+# can't use a lookbehind, PCRE2 only allows fixed-length ones.
+if [[ -z ${fingerprint} ]]; then
+    fingerprint=$(rg -INoP --no-messages --no-ignore -g '*build*.prop' "(?<=^ro\.build\.fingerprint=).+" . | head -n 1)
+    [[ -z ${fingerprint} ]] && fingerprint=$(rg -INoP --no-messages --no-ignore -g '*build*.prop' "^ro\.[a-z_]+\.build\.fingerprint=.+" . | head -n 1 | cut -d = -f 2-)
+    fingerprint=$(echo "$fingerprint" | tr -d '\r' | head -n 1)
+fi
+
+# Still nothing: rebuild it the same way init does on-device, see
+# property_derive_build_fingerprint() in init/property_service.cpp.
+# Only attempted when every component is known, so a genuinely broken
+# dump doesn't end up with a half-empty fingerprint.
+if [[ -z ${fingerprint} && -n ${brand} && -n ${codename} && -n ${release} && -n ${id} ]]; then
+    build_type=$(rg -m1 -INoP --no-messages "(?<=^ro\.build\.type=).+" {vendor,system,system/system}/build*.prop | head -n 1)
+    [[ -z ${build_type} ]] && build_type=$(echo "$flavor" | awk -F- '{ print $NF }')
+    product_name=$(rg -m1 -INoP --no-messages "(?<=^ro\.product\.name=).+" {vendor,system,system/system}/build*.prop | head -n 1)
+    [[ -z ${product_name} ]] && product_name=$(rg -m1 -INoP --no-messages "(?<=^ro\.product\.system\.name=).+" {system,system/system}/build*.prop | head -n 1)
+    [[ -z ${product_name} ]] && product_name="${codename}"
+    if [[ -n ${build_type} ]]; then
+        fingerprint="${brand}/${product_name}/${codename}:${release}/${id}/${incremental}:${build_type}/${tags}"
+        LOGW "No fingerprint in the dump, derived: ${fingerprint}"
+    fi
+fi
+
 # 'description' property (e.g. caiman-user 15 AP4A.241205.013 12621605 release-keys)
 description=$(rg -m1 -INoP --no-messages "(?<=^ro.build.description=).*" {system,system/system}/build.prop | head -n 1)
 [[ -z ${description} ]] && description=$(rg -m1 -INoP --no-messages "(?<=^ro.build.description=).*" {system,system/system}/build*.prop | head -n 1)
@@ -838,12 +870,18 @@ printf "# %s\n- manufacturer: %s\n- platform: %s\n- codename: %s\n- flavor: %s\n
 cat "${WORKING}"/README.md
 
 # Bail out if the dump is incomplete (no point pushing an empty repo
-# or spamming Telegram with a blank notification).
-if [[ -z "${codename}" || -z "${fingerprint}" || -z "${brand}" ]]; then
-    LOGE "Incomplete dump: missing codename/brand/fingerprint."
+# or spamming Telegram with a blank notification). Only 'codename' and
+# 'brand' are load-bearing, they name the repo and the branch; a missing
+# fingerprint is cosmetic, so warn about it and carry on.
+missing=()
+[[ -z "${codename}" ]] && missing+=("codename")
+[[ -z "${brand}" ]] && missing+=("brand")
+if [[ ${#missing[@]} -gt 0 ]]; then
+    LOGE "Incomplete dump: missing $(IFS='/'; echo "${missing[*]}")."
     LOGE "Skipping GitHub push and Telegram notification."
     exit 1
 fi
+[[ -z "${fingerprint}" ]] && LOGW "No fingerprint for this dump, pushing anyway."
 
 if [[ -n $GIT_OAUTH_TOKEN ]]; then
     prepare_push
