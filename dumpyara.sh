@@ -532,8 +532,17 @@ for partition in "${PARTITIONS[@]}"; do
                     fi
                 }
             else
-                # Try to extract file through '7z'
-                7z -snld x "${partition}".img -y -o"${partition}"/ > /dev/null || {
+                # Try to extract file through '7z'. Newer 7-Zip refuses links
+                # that point through other links unless '-snld' is >= 10
+                for snld in -snld20 -snld ""; do
+                    7z ${snld} x "${partition}".img -y -o"${partition}"/ > /dev/null
+                    rc="${?}"
+
+                    # 7 means this '7z' is too old for the switch
+                    [[ "${rc}" -ne 7 ]] && break
+                done
+
+                [[ "${rc}" -eq 0 ]] || {
                     LOGE "'${partition}' extraction via '7z' failed."
 
                     # Only abort if we're at the first occourence
