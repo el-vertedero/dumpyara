@@ -44,6 +44,92 @@ os_release() {
     sed -n "s/^${2}=//p" "${1}" | head -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
 }
 
+# Whether '${ORG}/${1}' already carries branch '${2}', i.e. whether this
+# firmware has been dumped before. 'all_files.txt' sits in the root of every
+# dump, so a 404 from 'raw.githubusercontent.com' means it's a new one.
+already_dumped() {
+    [[ -n "${1}" && -n "${2}" ]] || return 1
+    curl --silent --fail --output /dev/null \
+        "https://raw.githubusercontent.com/${ORG}/${1}/${2}/all_files.txt" 2> /dev/null
+}
+
+# Bail out if '${1}' (branch '${2}') has already been dumped. Pushing it
+# again is refused anyway, so there's no point in carrying on.
+bail_if_dumped() {
+    already_dumped "${1}" "${2}" || return 0
+    LOGE "Firmware already dumped! ('${ORG}/${1}', branch '${2}')"
+    exit 1
+}
+
+# Try to tell whether '${1}' has already been dumped before extracting
+# anything out of it: OTA packages carry the build fingerprint in their
+# metadata, and that's all the repository and the branch are named after.
+# Strictly best-effort, anything unexpected just falls through to the regular
+# (post-extraction) check.
+check_ota_metadata() {
+    local fingerprint brand product codename release id incremental type tags
+    local repo branch
+
+    fingerprint=$(ota_fingerprint "${1}") || return 0
+
+    # '<brand>/<product>/<codename>:<release>/<id>/<incremental>:<type>/<tags>'
+    [[ "${fingerprint}" =~ ^([^/:]+)/([^/:]+)/([^/:]+):([^/:]+)/([^/:]+)/([^/:]+):([^/:]+)/([^/:]+)$ ]] || return 0
+    brand="${BASH_REMATCH[1]}"
+    product="${BASH_REMATCH[2]}"
+    codename="${BASH_REMATCH[3]}"
+    release="${BASH_REMATCH[4]}"
+    id="${BASH_REMATCH[5]}"
+    incremental="${BASH_REMATCH[6]}"
+    type="${BASH_REMATCH[7]}"
+    tags="${BASH_REMATCH[8]}"
+
+    # The branch is 'ro.build.description' with its spaces turned into dashes,
+    # and that property is '<flavor> <release> <id> <incremental> <tags>' with
+    # the flavor being '<product>-<type>', so the fingerprint is enough to
+    # rebuild both names. Keep only what can appear in them: the metadata
+    # comes from the package, it doesn't get to shape the URL.
+    repo=$(printf '%s_%s_dump' "${brand}" "${codename}" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]._-')
+    branch=$(printf '%s-%s-%s-%s-%s-%s' "${product}" "${type}" "${release}" "${id}" "${incremental}" "${tags}" | tr -cd '[:alnum:]._-')
+
+    LOGI "Package reports '${fingerprint}', checking whether it's already dumped..."
+    bail_if_dumped "${repo}" "${branch}"
+}
+
+# Print the build fingerprint '${1}' advertises in its OTA metadata, fail if
+# there's none to be found. 'META-INF/com/android/metadata' spells it out as
+# 'post-build='; its protobuf replacement ('metadata.pb') keeps it as a plain
+# string, so fish it out by shape.
+ota_fingerprint() {
+    local entry metadata fingerprint
+    local shape='[^/:[:space:]]+/[^/:[:space:]]+/[^/:[:space:]]+:[^/:[:space:]]+/[^/:[:space:]]+/[^/:[:space:]]+:[^/:[:space:]]+/[^/:[:space:]]+'
+
+    [[ -f "${1}" ]] || return 1
+    command -v unzip > /dev/null 2>&1 || return 1
+
+    for entry in META-INF/com/android/metadata metadata; do
+        metadata=$(unzip -p "${1}" "${entry}" 2> /dev/null) || continue
+        fingerprint=$(printf '%s\n' "${metadata}" | sed -n 's/^post-build=//p' | head -n 1 | tr -d '\r')
+        [[ -n "${fingerprint}" ]] && { printf '%s' "${fingerprint}"; return 0; }
+    done
+
+    for entry in META-INF/com/android/metadata.pb metadata.pb; do
+        fingerprint=$(unzip -p "${1}" "${entry}" 2> /dev/null | LC_ALL=C tr -c '[:print:]' '\n' | \
+            grep -m 1 -oE "${shape}" | head -n 1)
+        [[ -n "${fingerprint}" ]] || continue
+
+        # Protobuf stores the string's length right in front of it, and for a
+        # fingerprint that byte is printable, so it ends up glued to the match.
+        # It gives itself away by spelling out the length of what follows.
+        [[ $(printf '%d' "'${fingerprint:0:1}") -eq $(( ${#fingerprint} - 1 )) ]] && \
+            fingerprint="${fingerprint:1}"
+
+        printf '%s' "${fingerprint}"
+        return 0
+    done
+
+    return 1
+}
+
 # Get the current directory ready to be pushed to '${ORG}/${repo}' (branch
 # '${branch}'): bail out if it's already there, create the repository and
 # replace files too large for GitHub with compressed copies. Committing and
@@ -53,7 +139,8 @@ prepare_push() {
     # URL credentials when it thinks the remote redirected, then tries to prompt.
     GIT_AUTH_HEADER="Authorization: Basic $(printf 'x-access-token:%s' "$GIT_OAUTH_TOKEN" | base64 -w0)"
     GITPUSH=(git -c http.extraHeader="$GIT_AUTH_HEADER" push https://github.com/"$ORG"/"${repo,,}".git "$branch")
-    curl --silent --fail "https://raw.githubusercontent.com/$ORG/$repo/$branch/all_files.txt" 2> /dev/null && LOGE "Firmware already dumped!" && exit 1
+    # Checked early too, this catches a dump that landed in the meantime
+    bail_if_dumped "${repo}" "${branch}"
     git init
     git config pack.windowMemory  256m
     git config pack.packSizeLimit 512m
@@ -283,6 +370,12 @@ EXTENSION=$(echo "${INPUT##*.}" | inline-detox)
 UNZIP_DIR=$(basename "${INPUT/.$EXTENSION/}" | sed 's/%[0-9A-Fa-f][0-9A-Fa-f]/_/g' | inline-detox)
 WORKING=${PWD}/working/${UNZIP_DIR}_
 
+# A firmware that's already been dumped is going to be rejected at push
+# time, so give it a shot now, before spending any time on the extraction
+if [[ -n $GIT_OAUTH_TOKEN && -f "${INPUT}" ]]; then
+    check_ota_metadata "${INPUT}"
+fi
+
 # Delete previously dumped project
 if [[ -d "${WORKING}" ]]; then
     rm -rf "${WORKING}"
@@ -399,6 +492,12 @@ if is_swupdate "${INPUT}"; then
     branch=$(echo "$description" | tr ' ' '-')
     repo=$(echo "$brand"_"$codename"_dump | tr '[:upper:]' '[:lower:]' | tr -d '\r\n')
     top_codename=$(echo "$codename" | tr '[:upper:]' '[:lower:]' | tr -dc '[:print:]' | tr '_' '-' | cut -c 1-35)
+
+    # Everything below (the FIT image, the file list) is wasted on a firmware
+    # that's already been dumped, and the names are all we needed to tell
+    if [[ -n $GIT_OAUTH_TOKEN ]]; then
+        bail_if_dumped "${repo}" "${branch}"
+    fi
 
     # 'boot.img' is a FIT image: pull out everything it carries
     if [[ -f boot.img ]] && [[ "$(od -A n -t x1 -N 4 boot.img | tr -d ' \n')" == "d00dfeed" ]]; then
@@ -557,123 +656,6 @@ for partition in "${PARTITIONS[@]}"; do
         rm -f "${partition}".img
     fi
 done
-
-# Also extract 'fsg.mbn' from 'radio.img'
-if [ -f "fsg.mbn" ]; then
-    LOGI "Extracting 'fsg.mbn' via '7zz'..."
-    mkdir "radio/fsg"
-
-    # Thankfully, 'fsg.mbn' is a simple EXT2 partition
-    7zz -snld x "fsg.mbn" -o"radio/fsg" > /dev/null
-
-    # Remove 'fsg.mbn'
-    rm -rf "fsg.mbn"
-fi
-
-# Extract and decompile device-tree blobs
-for image in boot vendor_boot vendor_kernel_boot; do
-    if [[ -f "${image}".img ]]; then
-        # Create working directories
-        mkdir -p "${image}/dtb" "${image}/dts"
-
-        # Unpack image's content
-        LOGI "Extracting '${image}' content..."
-        ${UNPACKBOOTIMG} -i "${image}.img" -o "${image}/" > /dev/null || \
-            LOGE "Extraction via 'unpackbootimg' unsuccessful."
-
-        ## Retrive image's ramdisk, and extract it
-        unlz4 "${image}"/"${image}".img-*ramdisk "${image}/ramdisk.lz4" >> /dev/null 2>&1
-        7z -snld x "${image}/ramdisk.lz4" -o"${image}/ramdisk" >> /dev/null 2>&1  || \
-            LOGI "Failed to extract ramdisk."
-
-        ## Clean-up
-        rm -rf "${image}/ramdisk.lz4"
-        rm -rf "${image}/${image}".img-*ramdisk
-
-        # Extract 'dtb' via 'extract-dtb'
-        LOGI "Trying to extract device-tree(s) from '${image}'..." 
-        uvx extract-dtb "${image}.img" -o "${image}/dtb" >> /dev/null 2>&1 || \
-            LOGE "Failed to extract device-tree blobs."
-
-        # Remove '00_kernel'
-        rm -rf "${image}/dtb/00_kernel"
-
-        # Decompile blobs to 'dts' via 'dtc'
-        for dtb in $(find "${image}/dtb" -type f); do
-            dtc -q -I dtb -O dts "${dtb}" >> "${image}/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
-                LOGE "Failed to decompile device-tree blobs."
-        done
-    fi
-
-    # If no device-tree were extracted or decompiled, delete the directories
-    if ! ls -A ${image}/dtb >> /dev/null 2>&1; then
-        rm -rf "${image}/dtb" "${image}/dts"
-    fi
-done
-
-# Extract 'boot.img'-related content
-if [[ -f boot.img ]]; then
-    # Extract 'ikconfig'
-    LOGI "Extracting 'ikconfig'..."
-    ${EXTRACT_IKCONFIG} boot.img > ikconfig 2>/dev/null || {
-        LOGW "No 'ikconfig' found in 'boot.img'"
-        rm -f ikconfig
-    }
-
-    # Generate non-stack symbols
-    LOGI "Generating 'boot.img-kallsyms'..."
-    ${VMLINUX_TO_ELF} kallsyms-finder boot.img >> /dev/null 2>&1 > boot/boot.img-kallsyms || \
-        LOGE "Failed to generate 'boot.img-kallsyms'"
-
-    # Generate analyzable '.elf'
-    LOGI "Extracting 'boot.img-elf'..."
-    ${VMLINUX_TO_ELF} vmlinux-to-elf boot.img boot/boot.img-elf >> /dev/null 2>&1 > /dev/null ||
-        LOGE "Failed to generate 'boot.img-elf'"
-fi
-
-# Extract 'dtbo.img' separately
-if [[ -f dtbo.img ]]; then
-    # Create working directories
-    mkdir -p "dtbo/dts"
-
-    # Extract 'dtb' via 'extract-dtb'
-    LOGI "Trying to extract device-tree(s) from 'dtbo'..." 
-    uvx extract-dtb "dtbo.img" -o "dtbo/"  >> /dev/null 2>&1 || \
-        LOGE "Failed to extract device-tree blobs."
-
-    # Remove '00_kernel'
-    rm -rf "dtbo/00_kernel"
-
-    # Decompile blobs to 'dts' via 'dtc'
-    for dtb in $(find "dtbo" -type f -name "*.dtb"); do
-        dtc -q -I dtb -O dts "${dtb}" >> "dtbo/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
-            LOGE "Failed to decompile device-tree blobs."
-    done
-fi
-
-# Generate 'board-info.txt'
-LOGI "Generating 'board-info.txt'..."
-
-## Generic
-if [ -f vendor/build.prop ]; then
-    strings ./vendor/build.prop | grep "ro.vendor.build.date.utc" | sed "s|ro.vendor.build.date.utc|require version-vendor|g" >> ./board-info.txt
-fi
-
-## Qualcomm-specific
-if [[ $(find . -wholename "modem") ]] && [[ $(find . -wholename "*./tz*") ]]; then
-    find ./modem -type f -exec strings {} \; | rg "QC_IMAGE_VERSION_STRING=MPSS." | sed "s|QC_IMAGE_VERSION_STRING=MPSS.||g" | cut -c 4- | sed -e 's/^/require version-baseband=/' >> board-info.txt
-    find ./tz* -type f -exec strings {} \; | rg "QC_IMAGE_VERSION_STRING" | sed "s|QC_IMAGE_VERSION_STRING|require version-trustzone|g" >> board-info.txt
-fi
-
-## Sort 'board-info.txt' content
-if [ -f board-info.txt ]; then
-    sort -u -o board-info.txt board-info.txt
-fi
-
-# Generate 'all_files.txt'
-LOGI "Generating 'all_files.txt'..."
-find . -type f ! -name all_files.txt \
-     -printf '%P\n' | sort | grep -v ".git/" > ./all_files.txt
 
 # 'flavor' property (e.g. caiman-user)
 flavor=$(rg -m1 -INoP --no-messages "(?<=^ro.build.flavor=).*" {vendor,system,system/system}/build.prop | head -n 1)
@@ -862,12 +844,6 @@ description=$(rg -m1 -INoP --no-messages "(?<=^ro.build.description=).*" {system
 [[ -z ${description} ]] && description=$(rg -m1 -INoP --no-messages "(?<=^ro.system.build.description=).*" {system,system/system}/build*.prop | head -n 1)
 [[ -z ${description} ]] && description="$flavor $release $id $incremental $tags"
 
-## Generate dummy device tree
-#mkdir -p "${WORKING}/aosp-device-tree"
-#LOGI "Generating dummy device tree..."
-#uvx aospdtgen . --output "${WORKING}/aosp-device-tree" >> /dev/null 2>&1 || \
-#    LOGE "Failed to generate AOSP device tree" && rm -rf "${WORKING}/aosp-device-tree"
-
 is_ab=$(grep -oP "(?<=^ro.build.ab_update=).*" -hs {system,system/system,vendor}/build*.prop | head -n 1)
 [[ -z "${is_ab}" ]] && is_ab="false"
 branch=$(echo "$description" | tr ' ' '-')
@@ -891,6 +867,136 @@ if [[ ${#missing[@]} -gt 0 ]]; then
     exit 1
 fi
 [[ -z "${fingerprint}" ]] && LOGW "No fingerprint for this dump, pushing anyway."
+
+# Dumping a firmware that's already on GitHub goes nowhere, and what's left
+# to do (boot image, device trees, file lists) isn't cheap, so bail out here
+# instead of at push time.
+if [[ -n $GIT_OAUTH_TOKEN ]]; then
+    bail_if_dumped "${repo}" "${branch}"
+fi
+
+# Also extract 'fsg.mbn' from 'radio.img'
+if [ -f "fsg.mbn" ]; then
+    LOGI "Extracting 'fsg.mbn' via '7zz'..."
+    mkdir "radio/fsg"
+
+    # Thankfully, 'fsg.mbn' is a simple EXT2 partition
+    7zz -snld x "fsg.mbn" -o"radio/fsg" > /dev/null
+
+    # Remove 'fsg.mbn'
+    rm -rf "fsg.mbn"
+fi
+
+# Extract and decompile device-tree blobs
+for image in boot vendor_boot vendor_kernel_boot; do
+    if [[ -f "${image}".img ]]; then
+        # Create working directories
+        mkdir -p "${image}/dtb" "${image}/dts"
+
+        # Unpack image's content
+        LOGI "Extracting '${image}' content..."
+        ${UNPACKBOOTIMG} -i "${image}.img" -o "${image}/" > /dev/null || \
+            LOGE "Extraction via 'unpackbootimg' unsuccessful."
+
+        ## Retrive image's ramdisk, and extract it
+        unlz4 "${image}"/"${image}".img-*ramdisk "${image}/ramdisk.lz4" >> /dev/null 2>&1
+        7z -snld x "${image}/ramdisk.lz4" -o"${image}/ramdisk" >> /dev/null 2>&1  || \
+            LOGI "Failed to extract ramdisk."
+
+        ## Clean-up
+        rm -rf "${image}/ramdisk.lz4"
+        rm -rf "${image}/${image}".img-*ramdisk
+
+        # Extract 'dtb' via 'extract-dtb'
+        LOGI "Trying to extract device-tree(s) from '${image}'..." 
+        uvx extract-dtb "${image}.img" -o "${image}/dtb" >> /dev/null 2>&1 || \
+            LOGE "Failed to extract device-tree blobs."
+
+        # Remove '00_kernel'
+        rm -rf "${image}/dtb/00_kernel"
+
+        # Decompile blobs to 'dts' via 'dtc'
+        for dtb in $(find "${image}/dtb" -type f); do
+            dtc -q -I dtb -O dts "${dtb}" >> "${image}/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
+                LOGE "Failed to decompile device-tree blobs."
+        done
+    fi
+
+    # If no device-tree were extracted or decompiled, delete the directories
+    if ! ls -A ${image}/dtb >> /dev/null 2>&1; then
+        rm -rf "${image}/dtb" "${image}/dts"
+    fi
+done
+
+# Extract 'boot.img'-related content
+if [[ -f boot.img ]]; then
+    # Extract 'ikconfig'
+    LOGI "Extracting 'ikconfig'..."
+    ${EXTRACT_IKCONFIG} boot.img > ikconfig 2>/dev/null || {
+        LOGW "No 'ikconfig' found in 'boot.img'"
+        rm -f ikconfig
+    }
+
+    # Generate non-stack symbols
+    LOGI "Generating 'boot.img-kallsyms'..."
+    ${VMLINUX_TO_ELF} kallsyms-finder boot.img >> /dev/null 2>&1 > boot/boot.img-kallsyms || \
+        LOGE "Failed to generate 'boot.img-kallsyms'"
+
+    # Generate analyzable '.elf'
+    LOGI "Extracting 'boot.img-elf'..."
+    ${VMLINUX_TO_ELF} vmlinux-to-elf boot.img boot/boot.img-elf >> /dev/null 2>&1 > /dev/null ||
+        LOGE "Failed to generate 'boot.img-elf'"
+fi
+
+# Extract 'dtbo.img' separately
+if [[ -f dtbo.img ]]; then
+    # Create working directories
+    mkdir -p "dtbo/dts"
+
+    # Extract 'dtb' via 'extract-dtb'
+    LOGI "Trying to extract device-tree(s) from 'dtbo'..." 
+    uvx extract-dtb "dtbo.img" -o "dtbo/"  >> /dev/null 2>&1 || \
+        LOGE "Failed to extract device-tree blobs."
+
+    # Remove '00_kernel'
+    rm -rf "dtbo/00_kernel"
+
+    # Decompile blobs to 'dts' via 'dtc'
+    for dtb in $(find "dtbo" -type f -name "*.dtb"); do
+        dtc -q -I dtb -O dts "${dtb}" >> "dtbo/dts/$(basename "${dtb}" | sed 's/\.dtb/.dts/')" || \
+            LOGE "Failed to decompile device-tree blobs."
+    done
+fi
+
+# Generate 'board-info.txt'
+LOGI "Generating 'board-info.txt'..."
+
+## Generic
+if [ -f vendor/build.prop ]; then
+    strings ./vendor/build.prop | grep "ro.vendor.build.date.utc" | sed "s|ro.vendor.build.date.utc|require version-vendor|g" >> ./board-info.txt
+fi
+
+## Qualcomm-specific
+if [[ $(find . -wholename "modem") ]] && [[ $(find . -wholename "*./tz*") ]]; then
+    find ./modem -type f -exec strings {} \; | rg "QC_IMAGE_VERSION_STRING=MPSS." | sed "s|QC_IMAGE_VERSION_STRING=MPSS.||g" | cut -c 4- | sed -e 's/^/require version-baseband=/' >> board-info.txt
+    find ./tz* -type f -exec strings {} \; | rg "QC_IMAGE_VERSION_STRING" | sed "s|QC_IMAGE_VERSION_STRING|require version-trustzone|g" >> board-info.txt
+fi
+
+## Sort 'board-info.txt' content
+if [ -f board-info.txt ]; then
+    sort -u -o board-info.txt board-info.txt
+fi
+
+# Generate 'all_files.txt'
+LOGI "Generating 'all_files.txt'..."
+find . -type f ! -name all_files.txt ! -wholename './README.md' \
+     -printf '%P\n' | sort | grep -v ".git/" > ./all_files.txt
+
+## Generate dummy device tree
+#mkdir -p "${WORKING}/aosp-device-tree"
+#LOGI "Generating dummy device tree..."
+#uvx aospdtgen . --output "${WORKING}/aosp-device-tree" >> /dev/null 2>&1 || \
+#    LOGE "Failed to generate AOSP device tree" && rm -rf "${WORKING}/aosp-device-tree"
 
 if [[ -n $GIT_OAUTH_TOKEN ]]; then
     prepare_push
